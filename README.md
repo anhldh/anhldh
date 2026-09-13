@@ -14,3 +14,7 @@ Here are some ideas to get you started:
 - 😄 Pronouns: ...
 - ⚡ Fun fact: ...
 -->
+<p align="center">
+  <img width="760" height="168" alt="anhldh — I build 3D things that run in a browser tab" src="https://github.com/user-attachments/assets/23c1c7d2-0189-4156-9a30-a7e4d91ddb60" />
+
+anhldh.com
