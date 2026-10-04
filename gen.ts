@@ -43,7 +43,8 @@ const CONFIG = {
   //   H = high UFO (next item from `extras`)       → shoot it down
   pattern: "CCMCCHCCMCCHCCH",
   showLabel: true, // show names above crates and UFOs
-  showScore: true, // dino-style score in the top-right corner
+  showScore: true, // score in the top-right corner: +1 for every obstacle cleared
+  scoreDigits: 4,
   crateIconSize: 20,
   ufoIconSize: 18,
   iconDir: "icons",
@@ -65,7 +66,6 @@ const CONFIG = {
   fallDrift: 24, // forward drift while falling (px)
   fallTilt: 30, // tilt while falling (deg)
   stepTime: 0.24, // walk cycle duration (s)
-  scoreTick: 0.1, // seconds per score point
 };
 
 // ---------- Sprites ----------
@@ -668,27 +668,53 @@ function build(t: Theme) {
     hillStrip += `<g transform="translate(${off} 0)">${hills(W, groundY, t.hill, px)}</g>`;
   }
 
-  // ---- Score: each digit is a vertical 0..9 column, clipped and moved with steps(10) ----
+  // ---- Score: +1 when each obstacle is cleared ----
+  // Each digit is a vertical 0..9 column, clipped to one cell and moved with hold-style keyframes.
+  // The score keeps growing across loops, so a digit's pattern only repeats after
+  // lcm(E, 10^(place+1)) points (E = obstacles per loop); that is the length of its animation.
   let hud = "";
   if (showScore) {
     const ds = 3,
       dW = 3 * ds,
       dH = 5 * ds,
       step = dH + ds * 2,
-      digits = 5,
+      digits = CONFIG.scoreDigits,
       top = 12;
     const numX = W - 20 - digits * (dW + ds) + ds;
+
+    // Moment each obstacle counts as cleared: after landing, after the UFO has passed, or on the hit
+    const ticks = level.map(
+      (o) => o.t + (o.kind === "C" ? jumpHalf : o.kind === "M" ? duckHalf : 0),
+    );
+    const E = ticks.length;
+    const gcd = (a: number, b: number): number => (b ? gcd(b, a % b) : a);
+
     let column = "";
     for (let n = 0; n < 10; n++)
       column += sprite(DIGITS[n], { "#": t.hud }, 0, n * step, ds);
+
     for (let d = 0; d < digits; d++) {
       const x = numX + d * (dW + ds);
-      const place = digits - 1 - d; // 0 = ones digit
+      const unit = 10 ** (digits - 1 - d); // 1 = ones digit
+      const points = (E * unit * 10) / gcd(E, unit * 10); // lcm(E, 10 * unit)
+      const dur = (points / E) * T;
+      const p = (time: number) => +((time / dur) * 100).toFixed(5);
+
+      let kf = `@keyframes sc${d} { 0% { transform: translateY(0); } `;
+      let prev = 0;
+      for (let n = 1; n <= points; n++) {
+        const value = Math.floor(n / unit) % 10;
+        if (value === prev) continue;
+        const time = Math.floor((n - 1) / E) * T + ticks[(n - 1) % E];
+        kf += `${p(time)}% { transform: translateY(-${value * step}px); } `;
+        prev = value;
+      }
+      kf += `100% { transform: translateY(0); } }`;
+
       hud += `<clipPath id="dg${d}"><rect x="${x}" y="${top}" width="${dW}" height="${dH}"/></clipPath>`;
       hud += `<g clip-path="url(#dg${d})"><g transform="translate(${x} ${top})"><g class="d${d}">${column}</g></g></g>`;
-      css += `.d${d} { animation: roll ${r(CONFIG.scoreTick * 10 ** (place + 1))}s steps(10, end) infinite; }\n`;
+      css += `.d${d} { animation: sc${d} ${r(dur)}s steps(1, end) infinite; }\n${kf}\n`;
     }
-    css += `@keyframes roll { to { transform: translateY(-${10 * step}px); } }\n`;
   }
 
   const heroPal = { "#": t.body, v: t.visor, e: t.eye, a: t.accent };
