@@ -9,8 +9,8 @@ I build 3D things that run in a browser tab: scene editors, 3D tours, simulation
 
 <p align="center">
   <picture>
-    <source media="(prefers-color-scheme: dark)" srcset="https://skillicons.dev/icons?i=ts,react,nextjs,threejs,go,nestjs,docker&theme=dark">
-    <img alt="TypeScript, React, Next.js, Three.js, NodeJs, NestJS, Docker, Go" src="https://skillicons.dev/icons?i=ts,react,nextjs,threejs,nodejs,nestjs,docker,go&theme=light">
+    <source media="(prefers-color-scheme: dark)" srcset="https://skillicons.dev/icons?i=ts%2Creact%2Cnextjs%2Cthreejs%2Cnodejs%2Cnestjs%2Cdocker%2Cgo&theme=dark">
+    <img alt="TypeScript, React, Next.js, Three.js, Node.js, NestJS, Docker, Go" src="https://skillicons.dev/icons?i=ts%2Creact%2Cnextjs%2Cthreejs%2Cnodejs%2Cnestjs%2Cdocker%2Cgo&theme=light">
   </picture>
 </p>
 
