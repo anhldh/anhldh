@@ -3,7 +3,11 @@
 // Run:     node --experimental-strip-types gen.ts   (Node 22.6+)  or  npx tsx gen.ts
 // Output:  hero-dark.svg, hero-light.svg
 //
-// Icon lookup order: icons/<icon>.svg (your own file) → simple-icons package → fallback crate with an X.
+// Icon lookup order: icons/<icon>.svg (your own file) → simple-icons package → no icon.
+//
+// How the animation works: the whole level loops every T seconds. Every animated part (scrolling,
+// jumping, ducking, shooting, falling UFOs) runs on that same T-second timeline, and the script
+// computes the exact moment each obstacle reaches the robot, then writes keyframes for the action.
 
 import { existsSync, readFileSync, writeFileSync } from "node:fs";
 import * as simpleIcons from "simple-icons";
@@ -11,6 +15,7 @@ import * as simpleIcons from "simple-icons";
 type StackItem = { name: string; icon?: string };
 
 const CONFIG = {
+  // Main stack → crates the robot jumps over
   // icon = simple-icons slug (see simpleicons.org) or a file name in icons/
   stack: [
     { name: "React", icon: "react" },
@@ -19,25 +24,51 @@ const CONFIG = {
     { name: "Three.js", icon: "threedotjs" },
     { name: "Node.js", icon: "nodedotjs" },
     { name: "NestJS", icon: "nestjs" },
-    { name: "Go", icon: "go" },
     { name: "Docker", icon: "docker" },
+    { name: "Git", icon: "git" },
+    { name: "Go", icon: "go" },
+    { name: "PostgreSQL", icon: "postgresql" },
   ] as StackItem[],
-  showLabel: true, // show the name above each crate
-  showCounter: true, // counter of crates jumped
-  iconSize: 20,
+  // Secondary stack → UFOs (ducked under or shot down)
+  extras: [
+    { name: "R3F", icon: "r3f" },
+    { name: "Zustand", icon: "zustand" },
+    { name: "MUI", icon: "mui" },
+    { name: "Ant Design", icon: "antdesign" },
+    { name: "Cloudflare", icon: "cloudflare" },
+  ] as StackItem[],
+  // Level layout, one character per obstacle:
+  //   C = crate (next item from `stack`)           → jump
+  //   M = mid-height UFO (next item from `extras`) → duck
+  //   H = high UFO (next item from `extras`)       → shoot it down
+  pattern: "CCMCCHCCMCCHCCH",
+  showLabel: true, // show names above crates and UFOs
+  showScore: true, // dino-style score in the top-right corner
+  crateIconSize: 20,
+  ufoIconSize: 18,
   iconDir: "icons",
   width: 840,
-  height: 176,
-  groundY: 150,
+  height: 190,
+  groundY: 164,
   px: 4, // size of one "pixel"
-  gap: 200, // distance between crates (px)
+  gap: 200, // distance between obstacles (px)
+  highBefore: 260, // space from the previous obstacle to a high UFO (room to land before shooting)
+  highAfter: 100, // space from a high UFO to the next obstacle
   speed: 160, // scroll speed (px/s)
   heroX: 90,
   jumpH: 84,
+  jumpHalf: 0.375, // seconds to rise (and to fall)
+  duckHalf: 0.45, // seconds ducked before/after a mid UFO passes
+  hitAhead: 140, // how far ahead of the robot a high UFO gets hit (px)
+  boltTime: 0.15, // laser travel time (s)
+  fallTime: 0.55, // time for a shot UFO to hit the ground (s)
+  fallDrift: 24, // forward drift while falling (px)
+  fallTilt: 30, // tilt while falling (deg)
   stepTime: 0.24, // walk cycle duration (s)
+  scoreTick: 0.1, // seconds per score point
 };
 
-// ---------- Sprite ----------
+// ---------- Sprites ----------
 // One character = one pixel; characters missing from the palette are transparent.
 const HERO_TOP = [
   "......a.....",
@@ -53,6 +84,17 @@ const HERO_TOP = [
   "..##aa######",
   "..########..",
   "...######...",
+];
+// Ducking: antenna retracted, body squashed
+const DUCK_TOP = [
+  "..########..",
+  ".##########.",
+  ".#vvvvvvvv#.",
+  ".#vvvevvve#.",
+  ".#vvvvvvvv#.",
+  ".##########.",
+  "..##aa######",
+  "..########..",
 ];
 const LEGS_A = ["...##...##..", "..##.....##."];
 const LEGS_B = ["....##.##...", "....##.##..."];
@@ -80,6 +122,32 @@ const CRATE_PLAIN = [
   "#########",
 ];
 
+// UFO: the glass dome (first 4 rows) holds the icon
+const UFO = [
+  "....ddddddd....",
+  "...ddddddddd...",
+  "..ddddddddddd..",
+  "..ddddddddddd..",
+  "..ddddddddddd..",
+  ".#############.",
+  "###############",
+  ".l..l..l..l..l.",
+];
+const DOME_ROWS = 5;
+
+const BOOM_A = [
+  "#...#...#",
+  ".#..#..#.",
+  "..#.o.#..",
+  "###ooo###",
+  "..#.o.#..",
+  ".#..#..#.",
+  "#...#...#",
+];
+const DUST = ["..#...#...#..", "#...#...#...#", ".###########."];
+
+const BOLT = [".#.", "###", ".#."];
+
 const CLOUD = ["...####.....", ".#########..", "############"];
 
 // 3x5 pixel digit font
@@ -95,9 +163,8 @@ const DIGITS = [
   ["###", "#.#", "###", "#.#", "###"],
   ["###", "#.#", "###", "..#", "###"],
 ];
-const TIMES = ["...", "#.#", ".#.", "#.#", "..."];
 
-// ---------- Theme ----------
+// ---------- Themes ----------
 type Theme = Record<
   | "body"
   | "visor"
@@ -106,6 +173,13 @@ type Theme = Record<
   | "crate"
   | "wood"
   | "icon"
+  | "hull"
+  | "dome"
+  | "lights"
+  | "ufoIcon"
+  | "boom"
+  | "core"
+  | "dust"
   | "ground"
   | "label"
   | "cloud"
@@ -123,6 +197,13 @@ const THEMES: Record<"dark" | "light", Theme> = {
     crate: "#a87a42",
     wood: "#4b3520",
     icon: "#f3e9da",
+    hull: "#9a7ae0",
+    dome: "#b6e3ff",
+    lights: "#ffd166",
+    ufoIcon: "#1b2230",
+    boom: "#ffb454",
+    core: "#fff3c4",
+    dust: "#8b949e",
     ground: "#6e7681",
     label: "#9da7b3",
     cloud: "#262c36",
@@ -137,6 +218,13 @@ const THEMES: Record<"dark" | "light", Theme> = {
     crate: "#6b4718",
     wood: "#d9a656",
     icon: "#4a3010",
+    hull: "#6e40c9",
+    dome: "#c8e6ff",
+    lights: "#d4a72c",
+    ufoIcon: "#0a3069",
+    boom: "#e5534b",
+    core: "#f2cc60",
+    dust: "#8c959f",
     ground: "#8c959f",
     label: "#59636e",
     cloud: "#e4e8ec",
@@ -148,7 +236,6 @@ const THEMES: Record<"dark" | "light", Theme> = {
 // ---------- Helpers ----------
 const esc = (s: string) =>
   s.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
-const mod = (a: number, n: number) => ((a % n) + n) % n;
 const r = (n: number) => +n.toFixed(3);
 
 // Merge consecutive same-colored pixels in a row into one rect to keep the file small
@@ -170,16 +257,16 @@ function sprite(
       }
       let len = 1;
       while (row[rx + len] === c) len++;
-      out += `<rect x="${x + rx * s}" y="${y + ry * s}" width="${len * s}" height="${s}" fill="${pal[c]}"/>`;
+      out += `<rect x="${r(x + rx * s)}" y="${r(y + ry * s)}" width="${len * s}" height="${s}" fill="${pal[c]}"/>`;
       rx += len;
     }
   });
   return out;
 }
 
-// ---------- Icon ----------
+// ---------- Icons ----------
 // keepColor = true for your own files (original colors kept), false for simple-icons (tinted by theme).
-type Icon = { symbol: string; keepColor: boolean };
+type Icon = { id: string; symbol: string; keepColor: boolean };
 
 function loadIcon(slug: string | undefined, id: string): Icon | null {
   if (!slug) return null;
@@ -200,6 +287,7 @@ function loadIcon(slug: string | undefined, id: string): Icon | null {
       viewBox = `0 0 ${w} ${h}`;
     }
     return {
+      id,
       symbol: `<symbol id="${id}" viewBox="${viewBox}">${inner}</symbol>`,
       keepColor: true,
     };
@@ -209,13 +297,19 @@ function loadIcon(slug: string | undefined, id: string): Icon | null {
   const si = (simpleIcons as Record<string, { path: string } | undefined>)[key];
   if (si?.path) {
     return {
+      id,
       symbol: `<symbol id="${id}" viewBox="0 0 24 24"><path d="${si.path}"/></symbol>`,
       keepColor: false,
     };
   }
 
-  console.warn(`! Icon "${slug}" not found — using an X crate`);
+  console.warn(`! Icon "${slug}" not found — drawing without an icon`);
   return null;
+}
+
+function useIcon(ic: Icon, x: number, y: number, size: number, tint: string) {
+  const fill = ic.keepColor ? "" : ` fill="${tint}"`;
+  return `<use href="#${ic.id}" x="${r(x)}" y="${r(y)}" width="${size}" height="${size}"${fill} class="icon"/>`;
 }
 
 // ---------- Distant hills ----------
@@ -237,84 +331,334 @@ function hills(W: number, groundY: number, color: string, s: number) {
   for (let i = 0; i < cols.length; ) {
     let j = i + 1;
     while (j < cols.length && cols[j].h === cols[i].h) j++;
-    const w = (j - i) * col;
-    out += `<rect x="${cols[i].x}" y="${groundY - cols[i].h}" width="${w}" height="${cols[i].h}" fill="${color}"/>`;
+    out += `<rect x="${cols[i].x}" y="${groundY - cols[i].h}" width="${(j - i) * col}" height="${cols[i].h}" fill="${color}"/>`;
     i = j;
   }
   return out;
 }
 
+// ---------- Level geometry & timeline ----------
+type Kind = "C" | "M" | "H";
+type Obstacle = { kind: Kind; t: number; cx: number; item: number };
+
+const px = CONFIG.px;
+const heroW = HERO_TOP[0].length * px;
+const heroCx = CONFIG.heroX + heroW / 2;
+const standH = (HERO_TOP.length + LEGS_A.length) * px;
+const duckH = (DUCK_TOP.length + LEGS_A.length) * px;
+const crateW = CRATE_X[0].length * px;
+const crateH = CRATE_X.length * px;
+const ufoW = UFO[0].length * px;
+const ufoH = UFO.length * px;
+const midUfoY = CONFIG.groundY - duckH - 4 - ufoH; // clears a ducking robot by 4px, hits a standing one
+const highUfoY = CONFIG.groundY - 120;
+const dropY = CONFIG.groundY - (highUfoY + ufoH); // fall distance of a shot UFO
+
+const kinds = [...CONFIG.pattern.replace(/\s/g, "")] as Kind[];
+if (kinds.some((k) => !"CMH".includes(k)))
+  throw new Error(`pattern may only contain C, M, H`);
+const N = kinds.length;
+// Space before each obstacle (the first one's space is measured from the last obstacle of the loop)
+const spacing = kinds.map((k, i) =>
+  k === "H"
+    ? CONFIG.highBefore
+    : kinds[(i - 1 + kinds.length) % kinds.length] === "H"
+      ? CONFIG.highAfter
+      : CONFIG.gap,
+);
+const L = spacing.reduce((a, b) => a + b, 0); // strip length
+const T = L / CONFIG.speed; // loop duration
+
+const crateCount = kinds.filter((k) => k === "C").length;
+const ufoCount = N - crateCount;
+if (crateCount !== CONFIG.stack.length)
+  console.warn(
+    `! pattern has ${crateCount} crates but stack has ${CONFIG.stack.length} items — stack will cycle`,
+  );
+if (ufoCount !== CONFIG.extras.length)
+  console.warn(
+    `! pattern has ${ufoCount} UFOs but extras has ${CONFIG.extras.length} items — extras will cycle`,
+  );
+
+// Each obstacle has an event time: for C and M it is when the obstacle is centered on the robot,
+// for H it is when the laser hits it (the UFO is then `hitAhead` px in front of the robot).
+const actionX = (k: Kind) => heroCx + (k === "H" ? CONFIG.hitAhead : 0);
+
+// Time span each event needs around its event time.
+// `busy` = the robot is occupied; `full` also covers the UFO falling and the dust cloud.
+const span = (k: Kind) => {
+  const { jumpHalf, duckHalf, boltTime, fallTime } = CONFIG;
+  if (k === "C")
+    return { busy: [-jumpHalf, jumpHalf], full: [-jumpHalf, jumpHalf] };
+  if (k === "M")
+    return { busy: [-duckHalf, duckHalf], full: [-duckHalf, duckHalf] };
+  return {
+    busy: [-boltTime - 0.05, 0.1],
+    full: [-boltTime - 0.05, fallTime + 0.25],
+  };
+};
+
+// Lay obstacles out along the strip, then place the loop seam in the middle of the quiet time
+// between the last event and the first one, so no animation ever crosses the seam.
+let pos = 0;
+const raw = kinds.map((k, i) => {
+  if (i > 0) pos += spacing[i];
+  return (pos - (actionX(k) - heroCx)) / CONFIG.speed; // event time before shifting
+});
+const lastEnd = raw[N - 1] + span(kinds[N - 1]).full[1];
+const firstStart = raw[0] + span(kinds[0]).full[0] + T;
+if (firstStart <= lastEnd)
+  console.warn(
+    "! not enough room at the loop seam — increase the spacing before the first obstacle",
+  );
+const shiftT = T - (lastEnd + firstStart) / 2;
+
+let nextCrate = 0,
+  nextUfo = 0;
+const level: Obstacle[] = kinds.map((kind, i) => {
+  const t = raw[i] + shiftT;
+  const cx = actionX(kind) + CONFIG.speed * t;
+  const item =
+    kind === "C"
+      ? nextCrate++ % CONFIG.stack.length
+      : nextUfo++ % CONFIG.extras.length;
+  return { kind, t, cx, item };
+});
+
+// Two robot actions must not overlap (e.g. shooting while still in the air)
+for (let i = 0; i < N; i++) {
+  const a = level[i],
+    b = level[(i + 1) % N];
+  const aEnd = a.t + span(a.kind).busy[1];
+  const bStart = b.t + span(b.kind).busy[0] + (i === N - 1 ? T : 0);
+  if (aEnd > bStart)
+    console.warn(
+      `! actions overlap: ${a.kind}#${i} and ${b.kind}#${(i + 1) % N} — add spacing`,
+    );
+}
+
+const pct = (t: number) => r((t / T) * 100);
+
+// Hold-style keyframes (use with steps(1, end)): `on` inside the intervals, `off` elsewhere
+function toggleKf(
+  name: string,
+  intervals: [number, number][],
+  on: number,
+  off: number,
+) {
+  let s = `@keyframes ${name} { 0% { opacity: ${off}; } `;
+  for (const [a, b] of intervals)
+    s += `${pct(a)}% { opacity: ${on}; } ${pct(b)}% { opacity: ${off}; } `;
+  return s + `100% { opacity: ${off}; } }`;
+}
+
+// Jump curve used by the self-check (close to the cubic-bezier ease-out/ease-in pair in the CSS)
+function jumpOffset(t: number) {
+  for (const o of level) {
+    if (o.kind !== "C") continue;
+    const d = (t - o.t) / CONFIG.jumpHalf;
+    if (Math.abs(d) < 1) return CONFIG.jumpH * (1 - d * d);
+  }
+  return 0;
+}
+
+// Sweep the loop and report any frame where the robot overlaps a live obstacle (falling UFOs included)
+function selfCheck() {
+  const { heroX, groundY, speed, duckHalf, fallTime, fallDrift } = CONFIG;
+  const hits = new Set<string>();
+  for (let t = 0; t < T; t += 0.005) {
+    const ducking = level.some(
+      (o) => o.kind === "M" && Math.abs(t - o.t) < duckHalf,
+    );
+    const lift = jumpOffset(t);
+    const hx0 = heroX + px,
+      hx1 = heroX + heroW - px;
+    const hy1 = groundY - lift;
+    const hy0 = ducking ? groundY - duckH : hy1 - standH + 2 * px; // ignore the thin antenna
+    level.forEach((o, i) => {
+      for (const shift of [-L, 0, L]) {
+        let x = o.cx + shift - speed * t;
+        let box: [number, number, number, number];
+        if (o.kind === "C")
+          box = [x - crateW / 2, x + crateW / 2, groundY - crateH, groundY];
+        else if (o.kind === "M")
+          box = [x - ufoW / 2, x + ufoW / 2, midUfoY, midUfoY + ufoH];
+        else {
+          if (shift < 0) continue; // shot down in the previous loop
+          let y = highUfoY;
+          if (shift === 0 && t >= o.t) {
+            const k = (t - o.t) / fallTime;
+            if (k > 1) continue; // already crashed
+            y += dropY * k * k;
+            x += fallDrift * k;
+          }
+          box = [x - ufoW / 2, x + ufoW / 2, y, y + ufoH];
+        }
+        if (hx0 < box[1] && hx1 > box[0] && hy0 < box[3] && hy1 > box[2])
+          hits.add(`${o.kind}#${i}`);
+      }
+    });
+  }
+  if (hits.size) console.warn(`! Collisions with: ${[...hits].join(", ")}`);
+  else console.log("✓ self-check: no collisions");
+}
+
 // ---------- Build ----------
-const icons = CONFIG.stack.map((item, i) => loadIcon(item.icon, `ic${i}`));
+const crateIcons = CONFIG.stack.map((item, i) => loadIcon(item.icon, `ic${i}`));
+const ufoIcons = CONFIG.extras.map((item, i) => loadIcon(item.icon, `ix${i}`));
 
 function build(t: Theme) {
   const {
     width: W,
     height: H,
     groundY,
-    px,
-    gap,
     speed,
     heroX,
     jumpH,
-    stack,
+    jumpHalf,
+    duckHalf,
+    boltTime,
+    fallTime,
+    fallDrift,
+    fallTilt,
     stepTime,
-    iconSize,
+    crateIconSize,
+    ufoIconSize,
     showLabel,
-    showCounter,
+    showScore,
   } = CONFIG;
 
-  const heroW = HERO_TOP[0].length * px;
-  const heroH = (HERO_TOP.length + LEGS_A.length) * px;
-  const heroY = groundY - heroH;
-  const crateW = CRATE_X[0].length * px;
-  const crateH = CRATE_X.length * px;
+  const heroY = groundY - standH;
+  const duckY = groundY - duckH;
+  const defs = [...crateIcons, ...ufoIcons]
+    .map((ic) => ic?.symbol ?? "")
+    .join("");
+  const cratePal = { "#": t.crate, w: t.wood };
+  const ufoPal = { "#": t.hull, d: t.dome, l: t.lights };
+  const boomPal = { "#": t.boom, o: t.core };
 
-  const defs = icons.map((ic) => ic?.symbol ?? "").join("");
+  // Laser starts at the front eye
+  const eyeX = heroX + 9 * px,
+    eyeY = heroY + 5 * px;
+  const boltX = eyeX + px / 2 - 4.5,
+    boltY = eyeY + px / 2 - 4.5;
 
-  // Obstacle strip: duplicated so the scroll loops seamlessly
-  const N = stack.length;
-  const stripLen = N * gap;
-  const stripDur = stripLen / speed;
-  const startX = 40;
+  // UFO with its icon in the dome and its name above
+  const ufoSprite = (cx: number, y: number, item: number) => {
+    const ic = ufoIcons[item];
+    let s = sprite(UFO, ufoPal, cx - ufoW / 2, y);
+    if (ic)
+      s += useIcon(
+        ic,
+        cx - ufoIconSize / 2,
+        y + (DOME_ROWS * px - ufoIconSize) / 2 + 1,
+        ufoIconSize,
+        t.ufoIcon,
+      );
+    if (showLabel)
+      s += `<text x="${r(cx)}" y="${r(y - 4)}" class="label">${esc(CONFIG.extras[item].name)}</text>`;
+    return `<g class="bob">${s}</g>`;
+  };
 
+  let css = "";
   let strip = "";
-  for (let k = 0; k < N * 2; k++) {
-    const i = k % N;
-    const x = startX + k * gap;
-    const y = groundY - crateH;
-    const ic = icons[i];
 
-    strip += sprite(
-      ic ? CRATE_PLAIN : CRATE_X,
-      { "#": t.crate, w: t.wood },
-      x,
-      y,
-    );
-    if (ic) {
-      const ix = x + (crateW - iconSize) / 2;
-      const iy = y + (crateH - iconSize) / 2;
-      const fill = ic.keepColor ? "" : ` fill="${t.icon}"`;
-      strip += `<use href="#ic${i}" x="${ix}" y="${iy}" width="${iconSize}" height="${iconSize}"${fill} class="icon"/>`;
-    }
-    if (showLabel) {
-      strip += `<text x="${x + crateW / 2}" y="${y - 8}" class="label">${esc(stack[i].name)}</text>`;
-    }
-    // pebbles on the ground
-    strip += `<rect x="${x + 70}" y="${groundY + 8}" width="${px * 2}" height="${px}" fill="${t.ground}"/>`;
-    strip += `<rect x="${x + 135}" y="${groundY + 14}" width="${px}" height="${px}" fill="${t.ground}"/>`;
+  // ---- Obstacles: three copies (-1, 0, +1 loop) so the strip is seamless on both sides ----
+  for (const shift of [-1, 0, 1]) {
+    level.forEach((o, i) => {
+      const cx = o.cx + shift * L;
+
+      if (o.kind === "C") {
+        const x = cx - crateW / 2,
+          y = groundY - crateH;
+        const ic = crateIcons[o.item];
+        strip += sprite(ic ? CRATE_PLAIN : CRATE_X, cratePal, x, y);
+        if (ic)
+          strip += useIcon(
+            ic,
+            x + (crateW - crateIconSize) / 2,
+            y + (crateH - crateIconSize) / 2,
+            crateIconSize,
+            t.icon,
+          );
+        if (showLabel)
+          strip += `<text x="${r(cx)}" y="${y - 8}" class="label">${esc(CONFIG.stack[o.item].name)}</text>`;
+      }
+
+      if (o.kind === "M") strip += ufoSprite(cx, midUfoY, o.item);
+
+      if (o.kind === "H") {
+        // copy -1 was shot in the previous loop, copy +1 will be shot in the next one
+        if (shift === 1) strip += ufoSprite(cx, highUfoY, o.item);
+        if (shift === 0) {
+          const cy = highUfoY + ufoH / 2;
+          const landX = cx + fallDrift;
+          strip += `<g class="fall u${i}">${ufoSprite(cx, highUfoY, o.item)}</g>`;
+          strip += `<g class="boom ba${i}">${sprite(BOOM_A, boomPal, cx - 18, cy - 14)}</g>`;
+          strip += `<g class="boom bd${i}">${sprite(DUST, { "#": t.dust }, landX - 26, groundY - 12)}</g>`;
+
+          const hit = o.t,
+            land = o.t + fallTime;
+          const fallen = `translate(${fallDrift}px, ${dropY}px) rotate(${fallTilt}deg)`;
+          css += `.u${i} { animation: u${i} ${r(T)}s linear infinite; }\n`;
+          css += `@keyframes u${i} { 0% { transform: none; opacity: 1; } `;
+          css += `${pct(hit)}% { transform: none; opacity: 1; animation-timing-function: cubic-bezier(.55,0,1,.45); } `;
+          css += `${pct(land)}% { transform: ${fallen}; opacity: 1; } `;
+          css += `${r(pct(land) + 0.01)}% { transform: ${fallen}; opacity: 0; } `;
+          css += `100% { transform: ${fallen}; opacity: 0; } }\n`;
+          css += `.ba${i} { animation: ba${i} ${r(T)}s steps(1, end) infinite; }\n${toggleKf(`ba${i}`, [[hit, hit + 0.12]], 1, 0)}\n`;
+          css += `.bd${i} { animation: bd${i} ${r(T)}s steps(1, end) infinite; }\n${toggleKf(`bd${i}`, [[land, land + 0.25]], 1, 0)}\n`;
+        }
+      }
+
+      // pebbles on the ground
+      const x = cx - spacing[i] / 2;
+      strip += `<rect x="${r(x + 70)}" y="${groundY + 8}" width="${px * 2}" height="${px}" fill="${t.ground}"/>`;
+      strip += `<rect x="${r(x + 135)}" y="${groundY + 14}" width="${px}" height="${px}" fill="${t.ground}"/>`;
+    });
   }
 
-  // Jump period = time for one crate to pass; phase is set so the jump peak happens right above a crate
-  const P = gap / speed;
-  const t0 = mod(startX + crateW / 2 - (heroX + heroW / 2), gap) / speed;
-  const jumpShift = mod(0.5 * P - t0, P); // animation-delay = -jumpShift
+  // ---- Robot timeline ----
+  const jumps = level.filter((o) => o.kind === "C");
+  const ducks = level
+    .filter((o) => o.kind === "M")
+    .map((o) => [o.t - duckHalf, o.t + duckHalf] as [number, number]);
+  const shots = level.filter((o) => o.kind === "H");
 
-  // Clouds and hills scroll slower (parallax)
+  let jumpKf = `@keyframes jump { 0% { transform: translateY(0); } `;
+  for (const o of jumps) {
+    jumpKf += `${pct(o.t - jumpHalf)}% { transform: translateY(0); animation-timing-function: cubic-bezier(.33,.66,.66,1); } `;
+    jumpKf += `${pct(o.t)}% { transform: translateY(-${jumpH}px); animation-timing-function: cubic-bezier(.33,0,.66,.33); } `;
+    jumpKf += `${pct(o.t + jumpHalf)}% { transform: translateY(0); } `;
+  }
+  jumpKf += `100% { transform: translateY(0); } }`;
+
+  // Laser bolt: outer group shows it during flight, inner group moves it from the eye to the UFO
+  const hitX = heroCx + CONFIG.hitAhead;
+  const dx = r(hitX - (boltX + 4.5)),
+    dy = r(highUfoY + ufoH / 2 - (boltY + 4.5));
+  let boltKf = `@keyframes boltMove { 0% { transform: translate(0, 0); } `;
+  for (const o of shots) {
+    boltKf += `${pct(o.t - boltTime)}% { transform: translate(0, 0); } ${pct(o.t)}% { transform: translate(${dx}px, ${dy}px); } `;
+  }
+  boltKf += `100% { transform: translate(${dx}px, ${dy}px); } }`;
+  const flights = shots.map((o) => [o.t - boltTime, o.t] as [number, number]);
+  const flashes = shots.map(
+    (o) => [o.t - boltTime - 0.05, o.t - boltTime + 0.1] as [number, number],
+  );
+
+  css += `.hero { animation: jump ${r(T)}s linear infinite; }\n${jumpKf}\n`;
+  css += `.stand { animation: stand ${r(T)}s steps(1, end) infinite; }\n${toggleKf("stand", ducks, 0, 1)}\n`;
+  css += `.duck { opacity: 0; animation: duck ${r(T)}s steps(1, end) infinite; }\n${toggleKf("duck", ducks, 1, 0)}\n`;
+  css += `.flash { opacity: 0; animation: flash ${r(T)}s steps(1, end) infinite; }\n${toggleKf("flash", flashes, 1, 0)}\n`;
+  css += `.boltShow { opacity: 0; animation: boltShow ${r(T)}s steps(1, end) infinite; }\n${toggleKf("boltShow", flights, 1, 0)}\n`;
+  css += `.boltMove { animation: boltMove ${r(T)}s linear infinite; }\n${boltKf}\n`;
+
+  // ---- Parallax: clouds and hills scroll slower ----
   const clouds = [
-    [150, 34],
-    [470, 22],
-    [700, 44],
+    [150, 26],
+    [470, 14],
+    [700, 34],
   ];
   let cloudStrip = "";
   let hillStrip = "";
@@ -324,46 +668,32 @@ function build(t: Theme) {
     hillStrip += `<g transform="translate(${off} 0)">${hills(W, groundY, t.hill, px)}</g>`;
   }
 
-  // Counter: each digit is a vertical 0..9 column, clipped by a clipPath and moved with steps(10).
-  // The ones digit ticks every P seconds, right when the robot lands (80% of the jump cycle).
+  // ---- Score: each digit is a vertical 0..9 column, clipped and moved with steps(10) ----
   let hud = "";
-  let hudCss = "";
-  if (showCounter) {
-    const ds = 3; // pixel size of the digit font
-    const dW = 3 * ds;
-    const dH = 5 * ds;
-    const step = dH + ds * 2; // distance between digits in the column
-    const digits = 4;
-    const right = W - 20;
-    const top = 16;
-    const landShift = mod(-(0.8 * P - jumpShift), P); // so each tick lands on the touchdown
-
-    const numX = right - digits * (dW + ds) + ds;
-    let col = "";
+  if (showScore) {
+    const ds = 3,
+      dW = 3 * ds,
+      dH = 5 * ds,
+      step = dH + ds * 2,
+      digits = 5,
+      top = 12;
+    const numX = W - 20 - digits * (dW + ds) + ds;
+    let column = "";
     for (let n = 0; n < 10; n++)
-      col += sprite(DIGITS[n], { "#": t.hud }, 0, n * step, ds);
-
+      column += sprite(DIGITS[n], { "#": t.hud }, 0, n * step, ds);
     for (let d = 0; d < digits; d++) {
       const x = numX + d * (dW + ds);
       const place = digits - 1 - d; // 0 = ones digit
       hud += `<clipPath id="dg${d}"><rect x="${x}" y="${top}" width="${dW}" height="${dH}"/></clipPath>`;
-      hud += `<g clip-path="url(#dg${d})"><g transform="translate(${x} ${top})"><g class="d${d}">${col}</g></g></g>`;
-      hudCss += `.d${d} { animation: roll ${r(P * 10 ** (place + 1))}s steps(10, end) infinite; animation-delay: -${r(landShift)}s; }\n  `;
+      hud += `<g clip-path="url(#dg${d})"><g transform="translate(${x} ${top})"><g class="d${d}">${column}</g></g></g>`;
+      css += `.d${d} { animation: roll ${r(CONFIG.scoreTick * 10 ** (place + 1))}s steps(10, end) infinite; }\n`;
     }
-    hud += sprite(TIMES, { "#": t.hud }, numX - 4 * ds - ds, top, ds);
-    const mini = 2;
-    hud += sprite(
-      CRATE_X,
-      { "#": t.crate, w: t.wood },
-      numX - 4 * ds - ds - 9 * mini - 6,
-      top - 0.5,
-      mini,
-    );
-    hudCss += `@keyframes roll { to { transform: translateY(-${10 * step}px); } }`;
+    css += `@keyframes roll { to { transform: translateY(-${10 * step}px); } }\n`;
   }
 
   const heroPal = { "#": t.body, v: t.visor, e: t.eye, a: t.accent };
-  const legsY = heroY + HERO_TOP.length * px;
+  const legs = (y: number) =>
+    `<g class="legA">${sprite(LEGS_A, heroPal, heroX, y)}</g><g class="legB">${sprite(LEGS_B, heroPal, heroX, y)}</g>`;
 
   return `<svg xmlns="http://www.w3.org/2000/svg" width="${W}" height="${H}" viewBox="0 0 ${W} ${H}" shape-rendering="crispEdges">
 <defs>${defs}</defs>
@@ -371,29 +701,26 @@ function build(t: Theme) {
   .label { font-family: -apple-system, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif; text-anchor: middle;
            font-size: 12px; font-weight: 600; fill: ${t.label}; }
   .icon { shape-rendering: geometricPrecision; }
+  .boom { opacity: 0; }
+  .fall { transform-box: fill-box; transform-origin: center; }
 
-  .strip { animation: scroll ${r(stripDur)}s linear infinite; }
-  @keyframes scroll { to { transform: translateX(-${stripLen}px); } }
+  .strip { animation: scroll ${r(T)}s linear infinite; }
+  @keyframes scroll { to { transform: translateX(-${L}px); } }
 
   .hills { animation: pan ${r(W / (speed / 4))}s linear infinite; }
   .clouds { animation: pan ${r(W / (speed / 8))}s linear infinite; }
   @keyframes pan { to { transform: translateX(-${W}px); } }
 
-  .hero { animation: jump ${r(P)}s linear infinite; animation-delay: -${r(jumpShift)}s; }
-  @keyframes jump {
-    0%, 20% { transform: translateY(0); animation-timing-function: cubic-bezier(.33,.66,.66,1); }
-    50% { transform: translateY(-${jumpH}px); animation-timing-function: cubic-bezier(.33,0,.66,.33); }
-    80%, 100% { transform: translateY(0); }
-  }
+  .bob { animation: bob 0.6s steps(1, end) infinite; }
+  @keyframes bob { 0% { transform: translateY(0); } 50% { transform: translateY(-${px}px); } }
 
   .legA, .legB { animation: step ${stepTime}s steps(1, end) infinite; }
   .legB { opacity: 0; animation-delay: -${stepTime / 2}s; }
   @keyframes step { 0% { opacity: 1; } 50% { opacity: 0; } }
 
-  ${hudCss}
-
+${css}
   @media (prefers-reduced-motion: reduce) {
-    .strip, .hills, .clouds, .hero, .legA, .legB, [class^="d"] { animation: none; }
+    * { animation: none !important; }
   }
 </style>
 <g class="clouds">${cloudStrip}</g>
@@ -401,15 +728,17 @@ function build(t: Theme) {
 <rect x="0" y="${groundY}" width="${W}" height="2" fill="${t.ground}"/>
 <g class="strip">${strip}</g>
 <g class="hero">
-  ${sprite(HERO_TOP, heroPal, heroX, heroY)}
-  <g class="legA">${sprite(LEGS_A, heroPal, heroX, legsY)}</g>
-  <g class="legB">${sprite(LEGS_B, heroPal, heroX, legsY)}</g>
+  <g class="stand">${sprite(HERO_TOP, heroPal, heroX, heroY)}${legs(heroY + HERO_TOP.length * px)}</g>
+  <g class="duck">${sprite(DUCK_TOP, heroPal, heroX, duckY)}${legs(duckY + DUCK_TOP.length * px)}</g>
+  <g class="flash"><rect x="${eyeX - px}" y="${eyeY - px}" width="${px * 3}" height="${px * 3}" fill="${t.eye}" opacity=".45"/><rect x="${eyeX}" y="${eyeY}" width="${px}" height="${px}" fill="${t.core}"/></g>
 </g>
+<g class="boltShow"><g class="boltMove">${sprite(BOLT, { "#": t.eye }, boltX, boltY, 3)}</g></g>
 ${hud}
 </svg>
 `;
 }
 
+selfCheck();
 for (const name of ["dark", "light"] as const) {
   writeFileSync(`hero-${name}.svg`, build(THEMES[name]));
   console.log(`✓ hero-${name}.svg`);
